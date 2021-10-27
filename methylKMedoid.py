@@ -8,6 +8,7 @@ from Bio import SeqIO
 from skbio import DistanceMatrix
 from skbio.sequence import Sequence
 from skbio.sequence.distance import hamming
+from sklearn.metrics.pairwise import pairwise_distances
 
 def GatherInput(infile):
     '''Reads in the bait fasta file and converts them to two lists- one containing headers and the other containing sequences'''
@@ -50,10 +51,7 @@ def FindConversionIndexes(seq, plant=False):
                 if seq[i+1] != "G" or seq[i+1] != "g": #this takes into account both cases
                     positions.append(i)
     
-    if len(positions) > 12:
-        return list(set(positions[::2]))
-    else: 
-        return list(set(positions))
+    return list(set(positions))
 
 def MakeConvertedBaits(base, seq, indexes, n=100):
     SeqGroup = []
@@ -61,7 +59,7 @@ def MakeConvertedBaits(base, seq, indexes, n=100):
     #the powerset can be potentially too large, therefore, I need to subset it down.
     if 2**len(indexes) > n:
         #generate random numbers and only make those iterations, up to n numbers
-        print(f"Making up to {n} iterations")
+        #print(f"Making up to {n} iterations")
         np.random.seed(15)
         chosen = np.random.choice(range(2**len(indexes)), size=n,replace=False)
     #iterate over the powerset of the indexes that need to be changed, effectively making all possibilities
@@ -120,7 +118,7 @@ def MakeAllPossibleConversionSchemes(baitHeaders, baitSequences, iterations, pla
     convertedSeqs = []
     
     for header, seq in zip(baitHeaders, baitSequences):
-        #produce the complement sequence as we need to do both strands, will reverse this at the end
+        #produce the complement sequence as we need to do both strands
         comp = ReverseComplementSequence(seq)
         
         if plant:
@@ -196,36 +194,77 @@ def kMedoids(D, k, tmax=100):
 	# return results
 	return M, C
 
-def WriteFileForTMCalc(sequences, headers):
+def WriteFileForTMCalc(sequences):
     '''Takes in a list of lists of converted sequences and writes every cross iteration to a file for TM calculation'''
-    for seqs, heads in zip(sequences, headers):
-        fname = heads[0] + '.TMcalcReady'
-        with open(fname, 'w') as f:
-            if len(seqs) < 4:
+    if os.path.exists(os.path.join(os.getcwd(),"temp.txt")):
+        fname = "temp-2676236.txt"
+    else:
+        fname = "temp.txt"
+    with open(fname, 'w') as f:
+        for seqgroup in sequences:
+            if len(seqgroup) < 4:
                 pass
             else:
-                for i, seq in enumerate(seqs):
-                    for k,s in enumerate(seqs):
+                for i, seq in enumerate(seqgroup):
+                    for k,s in enumerate(seqgroup):
+                        print(seq)
                         f.write(seq + '\t' + s + '\n')
-    
+    return fname
 
-def CallTMCalc(threads):
-    cwd = os.getcwd()
-    for f in os.listdir(cwd):
-        if f.split('.')[-1] == "TMcalcReady":
-            base = ".".join(f.split(".")[:-1])
-            outfile = base + '.TMcalc'
-            os.system(f"java -jar /tools/javatools/GetTmFromSeqPairsMultiThreaded.jar {f} 50 0.0164 {threads} > {outfile}")
+def CallTMCalc(fname, threads):
+    os.system(f"java -jar /tools/javatools/GetTmFromSeqPairsMultiThreaded.jar {fname} 50 0.0164 {threads} > TMcalc.txt")
 
-def ReadTMToMatrix(fname):
-    '''Need to read this file and separate them out into a bunch of different files that are in lsmat format so that the skbio distance matrix object can read in the file.
-        from skbio documentation, it expects something like this:
-        <del>a<del>b
-        a<del>0.0<del>1.0
-        b<del>1.0<del>0.0 
-    '''
-    pass
-            
+def valuesToDistance(values):
+    lines = []
+    currentSeq = values[0].split("\t")[0]
+    headers = [currentSeq]
+    currentLine = ""
+    first = True
+    for line in values:
+        if line.split('\t')[0] != currentSeq:
+            lines.append(currentLine + '\n')
+            currentSeq = line.split('\t')[0]
+            headers.append(line.split('\t')[0])
+            currentLine = "{:.3f}".format(float(line.split('\t')[-1].strip()))
+        else:
+            if first:
+                currentLine += "{:.3f}".format(float(line.split('\t')[-1].strip()))
+                first = False
+            else:
+                currentLine += '\t' + "{:.3f}".format(float(line.split('\t')[-1].strip()))
+    lines.append(currentLine + '\n')
+    return lines, headers
+
+def WriteMatrixToFile(lines, headers, fname):
+    with open(fname, 'w') as f:
+        f.write("\t".join(headers) + '\n')
+        for i in lines:
+            f.write(i)
+
+def ReadTMToMatrix(fname, convertedSeqs, convertedHeaders):
+    with open(fname, 'r') as f:
+        lines = f.readlines()
+        counter = 0
+        for group, head in zip(convertedSeqs, convertedHeaders):
+            if len(group) >= 4:
+                base = head[0] + '.matrix'
+                toTake = len(group) * len(group)
+                values = lines[counter:counter + toTake]
+                counter += toTake
+                toPrint, headers = valuesToDistance(values)
+                print(len(headers), len(toPrint))
+                WriteMatrixToFile(toPrint, headers, base)
+            else:
+                counter += len(group) * len(group)
+            break
+
+def ReadInTMDistanceMatrix(fname):
+    data = np.genfromtxt(fname, dtype=float, delimiter="\t", skip_header=1)
+    d = pairwise_distances(data, metric="precomputed") 
+    f = open(fname, 'r')
+    lines = f.readlines()
+    seqs = [item for item in lines[0].split('\t')]
+    return seqs, d
 
 
 def Main(args):
@@ -244,9 +283,39 @@ def Main(args):
         #    matrix = DistanceMatrix.from_iterable(s, metric=CalcHammingDistances, keys=heads)
     
     #for now need to write a file to calculate all of the TMs for the possibilities. This file will likely be huge
-    WriteFileForTMCalc(convertedSeqs)
-    CallTMCalc(args.threads)
-    distanceMatrix = ReadTMToMatrix("TMcalc.txt")
+    if args.TM:
+        fileName = WriteFileForTMCalc(convertedSeqs)
+        CallTMCalc(fileName, args.threads)
+        ReadTMToMatrix("TMcalc.txt", convertedSeqs, convertedHeaders)
+
+        for f in os.listdir(os.getcwd()):
+            if f.split('.')[-1] == "matrix":
+                seqs, matrix = ReadInTMDistanceMatrix(f)
+                for i in range(2,7):
+                    try:
+                        medoids, clusters = kMedoids(matrix, i)
+                        print(medoids, clusters)
+                        for med in medoids:
+                            print(seqs[med])
+                            print(matrix[med])
+                    except ValueError:
+                        pass
+
+    else:
+        count = 0
+        for heads, s in zip(convertedHeaders, convertedSeqs):
+            if len(heads) == 1 and len(s) == 1:
+                pass
+        else:
+            print("got to here")
+            count += 1
+            matrix = DistanceMatrix.from_iterable(s, metric=CalcHammingDistances, keys=heads)
+            for i in range(2,7):
+                try:
+                    medoids, clusters = kMedoids(matrix, i)
+                    print(medoids, clusters)
+                except ValueError:
+                    pass
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(prog="Makes baits for methyl cap from an existing bait set produced with BaitDesigner. It will produce all possible combinations of baits and then attempt to reduce the number via a k-medoids clustering approach")
@@ -255,7 +324,8 @@ if __name__ == "__main__":
     parser.add_argument("--plant", action="store_true", help="If this is for a plant genome, the additional methylation schemes (apart from CpG) CpHpG and CpHpH will be considered")
     parser.add_argument("--threads", nargs="?", const="4", help=" Default value: 4 . How many threads you would like to run for TM calculation")
     parser.add_argument("--iterations", nargs="?", const=100,type=int, help="How many methyl schemes to predict. This is greatly constrained by amount of RAM available on the machine. 100 is a good a place to start, 5000 is likely too large. The larger this number is the better chances your medoids are actual medoids though. Its a delicate balance.")
-    
+    parser.add_argument("--TM", action="store_true", help="If you would like the disimilarity matrix (and thus the clustering) to be based on the TM of possible probe choices then provide this option.")
+
     args = parser.parse_args()
 
     if len(sys.argv) < 2:
@@ -263,3 +333,4 @@ if __name__ == "__main__":
         sys.exit(1)
 
     Main(args)
+
